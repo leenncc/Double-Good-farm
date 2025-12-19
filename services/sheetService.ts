@@ -39,8 +39,6 @@ export const getRawMaterialRate = (): number => parseFloat(localStorage.getItem(
 export const setRawMaterialRate = (rate: number) => localStorage.setItem(STORAGE_KEY_RAW_RATE, rate.toString());
 
 const cleanFirestoreData = <T>(data: T): T => JSON.parse(JSON.stringify(data));
-const getUserCollection = (collectionName: string) => db.collection(collectionName);
-const getUserDoc = (collectionName: string, docId: string) => db.collection(collectionName).doc(docId);
 
 // ============================================================================
 // CORE DATA SERVICES
@@ -163,7 +161,6 @@ export const submitOnlineOrder = async (customerName: string, customerPhone: str
             }
         } else {
             const newId = `cust-shop-${Date.now()}`;
-            // Fix: Removed duplicate 'name' property in the newCust object literal
             const newCust: Customer = { 
                 id: newId, name: customerName, email: customerEmail, contact: customerPhone, 
                 address: customerAddress, type: 'B2C', status: 'ACTIVE', joinDate: new Date().toISOString() 
@@ -186,7 +183,7 @@ export const submitOnlineOrder = async (customerName: string, customerPhone: str
             finishedGoodId: c.item.id, recipeName: c.item.recipeName, 
             packagingType: c.item.packagingType, quantity: c.qty, unitPrice: c.item.sellingPrice 
         })), 
-        totalAmount: cartItems.reduce((sum, c) => sum + (c.item.sellingPrice * c.qty), 0), 
+        totalAmount: cartItems.reduce((sum, c) => sum + ((c.item.sellingPrice || 15) * c.qty), 0), 
         paymentMethod: 'COD', status: 'QUOTATION', dateCreated: new Date().toISOString()
     };
     
@@ -262,7 +259,6 @@ export const getFinishedGoods = async (forceRemote = false) => {
   return { success: true, data: snap.docs.map(d => d.data() as FinishedGood) };
 };
 
-// Added ApiResponse return type and error handling
 export const updateFinishedGoodImage = async (recipeName: string, packagingType: string, file: File): Promise<ApiResponse<void>> => {
     try {
         const storageRef = storage.ref(`products/${Date.now()}_${file.name}`);
@@ -313,14 +309,64 @@ export const getPurchaseOrders = async () => {
 };
 
 export const createPurchaseOrder = async (itemId: string, qty: number, supplier: string) => {
-    const po: PurchaseOrder = { id: `PO-${Date.now()}`, itemId, itemName: 'Item', quantity: qty, packSize: 1, totalUnits: qty, unitCost: 0, totalCost: 0, status: 'ORDERED', dateOrdered: new Date().toISOString(), supplier };
+    const invRes = await getInventory();
+    const item = (invRes.data || []).find(i => i.id === itemId);
+    const unitCost = item?.unitCost || 0;
+    const packSize = item?.packSize || 1;
+    const totalUnits = qty * packSize;
+    const totalCost = qty * unitCost;
+
+    const po: PurchaseOrder = { 
+        id: `PO-${Date.now()}`, 
+        itemId, 
+        itemName: item?.name || 'Item', 
+        quantity: qty, 
+        packSize, 
+        totalUnits, 
+        unitCost, 
+        totalCost, 
+        status: 'ORDERED', 
+        dateOrdered: new Date().toISOString(), 
+        supplier 
+    };
     await db.collection('purchase_orders').doc(po.id).set(cleanFirestoreData(po));
     return { success: true };
 };
 
+/**
+ * Enhanced receivePurchaseOrder:
+ * Increases inventory levels based on received units.
+ */
 export const receivePurchaseOrder = async (id: string, qc: boolean) => {
-    await db.collection('purchase_orders').doc(id).update({ status: qc ? 'RECEIVED' : 'COMPLAINT', dateReceived: new Date().toISOString() });
-    return { success: true };
+    try {
+        const poRef = db.collection('purchase_orders').doc(id);
+        const poSnap = await poRef.get();
+        if (!poSnap.exists) return { success: false, message: 'Order not found' };
+        
+        const po = poSnap.data() as PurchaseOrder;
+        
+        if (qc) {
+            // Update Inventory level
+            const invRef = db.collection('inventory').doc(po.itemId);
+            await invRef.update({
+                quantity: firebase.firestore.FieldValue.increment(po.totalUnits)
+            });
+            
+            await poRef.update({ 
+                status: 'RECEIVED', 
+                dateReceived: new Date().toISOString(),
+                qcPassed: true
+            });
+        } else {
+            await poRef.update({ 
+                status: 'COMPLAINT', 
+                qcPassed: false
+            });
+        }
+        return { success: true };
+    } catch (e: any) {
+        return { success: false, message: e.message };
+    }
 };
 
 export const complaintPurchaseOrder = async (id: string, reason: string) => {
@@ -361,13 +407,79 @@ export const createBatch = async (farm: string, raw: number, spoiled: number, fa
     return { success: true, data: batch };
 };
 
-// Added ApiResponse return type and error handling
-export const packRecipeFIFO = async (name: string, weight: number, count: number, type: 'TIN' | 'POUCH'): Promise<ApiResponse<void>> => {
+/**
+ * Enhanced packRecipeFIFO:
+ * 1. Atomically deducts raw material weight from batches in FIFO order.
+ * 2. Deducts packaging and label stock from inventory.
+ * 3. Creates FinishedGood record.
+ */
+export const packRecipeFIFO = async (recipeName: string, totalWeightToPack: number, packCount: number, packagingType: 'TIN' | 'POUCH'): Promise<ApiResponse<void>> => {
     try {
-        const fg: FinishedGood = { id: `FG-${Date.now()}`, batchId: 'FIFO', recipeName: name, packagingType: type, quantity: count, datePacked: new Date().toISOString(), sellingPrice: 15 };
-        await db.collection('finished_goods').doc(fg.id).set(cleanFirestoreData(fg));
+        const batchRes = await fetchBatches();
+        const invRes = await getInventory();
+        
+        const inventory = invRes.data || [];
+        const batches = (batchRes.data || [])
+            .filter(b => (b.selectedRecipeName === recipeName || b.recipeType === recipeName) && 
+                         (b.status === BatchStatus.DRYING_COMPLETE || b.status === BatchStatus.PACKED) &&
+                         (b.remainingWeightKg ?? b.netWeightKg) > 0.001)
+            .sort((a, b) => new Date(a.dateReceived).getTime() - new Date(b.dateReceived).getTime());
+
+        // 1. Check Inventory First
+        const pkgItem = inventory.find(i => i.subtype === packagingType || i.name.toUpperCase().includes(packagingType));
+        const labelItem = inventory.find(i => i.type === 'LABEL' || i.subtype === 'STICKER');
+        
+        if (!pkgItem || pkgItem.quantity < packCount) return { success: false, message: `Insufficient ${packagingType} packaging` };
+        if (!labelItem || labelItem.quantity < packCount) return { success: false, message: 'Insufficient Labels/Stickers' };
+
+        // 2. FIFO Batch Deduction
+        let remainingToDeduct = totalWeightToPack;
+        const batchUpdates: Promise<any>[] = [];
+        
+        for (const batch of batches) {
+            if (remainingToDeduct <= 0) break;
+            
+            const currentAvail = batch.remainingWeightKg ?? batch.netWeightKg;
+            const deduction = Math.min(currentAvail, remainingToDeduct);
+            const newRemaining = currentAvail - deduction;
+            
+            remainingToDeduct -= deduction;
+            
+            batchUpdates.push(db.collection('batches').doc(batch.id).update({
+                remainingWeightKg: newRemaining,
+                status: newRemaining < 0.01 ? BatchStatus.PACKED : batch.status,
+                packedDate: new Date().toISOString()
+            }));
+        }
+
+        if (remainingToDeduct > 0.1) {
+            return { success: false, message: `Insufficient raw material weight. Missing ${remainingToDeduct.toFixed(2)}kg` };
+        }
+
+        // 3. Update Inventory (Packaging & Labels)
+        const invUpdates = [
+            db.collection('inventory').doc(pkgItem.id).update({ quantity: firebase.firestore.FieldValue.increment(-packCount) }),
+            db.collection('inventory').doc(labelItem.id).update({ quantity: firebase.firestore.FieldValue.increment(-packCount) })
+        ];
+
+        // 4. Create Finished Good
+        const fg: FinishedGood = { 
+            id: `FG-${Date.now()}`, 
+            batchId: 'MULTIPLE_FIFO', 
+            recipeName, 
+            packagingType, 
+            quantity: packCount, 
+            datePacked: new Date().toISOString(), 
+            sellingPrice: 15.00 
+        };
+        const fgUpdate = db.collection('finished_goods').doc(fg.id).set(cleanFirestoreData(fg));
+
+        // Execute all updates
+        await Promise.all([...batchUpdates, ...invUpdates, fgUpdate]);
+        
         return { success: true };
     } catch (error: any) {
+        console.error("Pack error:", error);
         return { success: false, message: error.message || 'Failed to pack recipe' };
     }
 };
