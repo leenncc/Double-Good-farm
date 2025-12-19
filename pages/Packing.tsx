@@ -1,3 +1,4 @@
+
 import React, { useEffect, useState } from 'react';
 import { fetchBatches, packRecipeFIFO, getInventory, getPackingHistory } from '../services/sheetService';
 import { MushroomBatch, BatchStatus, InventoryItem, FinishedGood } from '../types';
@@ -56,7 +57,6 @@ const PackingPage: React.FC = () => {
     setShowModal(true);
   };
 
-  // FIX: Defensive check for recipe name to prevent toLowerCase error on potentially undefined string
   const recipeRatio = (selectedRecipe?.name || '').toLowerCase().includes('dried') ? 0.3 : 0.4;
   const packSize = packagingType === 'POUCH' ? 0.1 : 0.2;
   const calculatedYield = weightToPack ? Math.floor((parseFloat(weightToPack) * recipeRatio) / packSize) : 0;
@@ -73,7 +73,6 @@ const PackingPage: React.FC = () => {
     }, 3000);
   };
 
-  // FIX: Defensive check for inventory item name to prevent toLowerCase error on potentially undefined string
   const pouchTotal = inventory
     .filter(i => i.subtype === 'POUCH' || (i.name || '').toLowerCase().includes('pouch'))
     .reduce((sum, item) => sum + item.quantity, 0);
@@ -188,10 +187,10 @@ const PackingPage: React.FC = () => {
                    </div>
                 </div>
                 <div className="bg-slate-50 p-4 rounded-lg flex justify-between items-center"><span className="text-sm font-bold text-slate-600">Estimated Output:</span><span className="text-2xl font-bold text-nature-700">{calculatedYield} units</span></div>
-                {!hasStock && isYieldValid && (<div className="bg-red-50 text-red-600 p-3 rounded-lg text-sm font-bold flex flex-col items-start"><div><AlertCircle size={16} className="inline mr-2" /> Insufficient Inventory</div><span className="text-xs ml-6">Missing: {missingItems.join(', ')}</span></div>)}
+                {!hasStock && isYieldValid && (<div className="bg-red-50 text-red-600 p-3 rounded-lg text-sm font-bold flex flex-col items-start"><div><AlertCircle size={16} className="inline mr-2" /> Insufficient Inventory</div><span className="text-xs ml-6">Missing: {missingItems.join(', ')} (You can still proceed)</span></div>)}
                 <div className="flex space-x-3 pt-4">
                    <button onClick={() => setShowModal(false)} className="flex-1 py-3 text-slate-500 hover:bg-slate-50 rounded-lg font-bold">Cancel</button>
-                   <button onClick={handleCompletePacking} disabled={!hasStock || !weightToPack || !isYieldValid || parseFloat(weightToPack) > selectedRecipe.totalWeight} className="flex-1 py-3 bg-earth-800 text-white rounded-lg font-bold">Confirm Pack</button>
+                   <button onClick={handleCompletePacking} disabled={!weightToPack || !isYieldValid || parseFloat(weightToPack) > selectedRecipe.totalWeight} className="flex-1 py-3 bg-earth-800 text-white rounded-lg font-bold">Confirm Pack</button>
                 </div>
              </div>
           </div>

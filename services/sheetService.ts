@@ -163,9 +163,10 @@ export const submitOnlineOrder = async (customerName: string, customerPhone: str
             }
         } else {
             const newId = `cust-shop-${Date.now()}`;
+            // Fix: Removed duplicate 'name' property in the newCust object literal
             const newCust: Customer = { 
                 id: newId, name: customerName, email: customerEmail, contact: customerPhone, 
-                address: customerAddress, name: customerName, type: 'B2C', status: 'ACTIVE', joinDate: new Date().toISOString() 
+                address: customerAddress, type: 'B2C', status: 'ACTIVE', joinDate: new Date().toISOString() 
             };
             
             try {
